@@ -1,0 +1,219 @@
+# Thực hành nâng cấp Hệ thống RAG Giao Thông Lên Agentic V2
+
+Chào mừng bạn đến với bài thực hành nâng cấp hệ thống RAG tĩnh lên mô hình Agent linh hoạt. 
+Thay vì sao chép toàn bộ một cục code lớn, chúng ta sẽ thực hành **qua từng khái niệm (cell)** để hiểu cốt lõi của việc chuyển đổi.
+
+Vui lòng tạo một file Jupyter Notebook mới (ví dụ: `upgrade_lab.ipynb`) ở cùng thư mục với `test.ipynb` và làm theo từng cell dưới đây.
+
+---
+
+### [Cell 1] Khởi tạo môi trường và Retriever
+
+Đầu tiên, hệ thống Agent vẫn cần "não" (LLM) và "sách" (Retriever). Ta sẽ khởi tạo chúng nhưng sử dụng thư viện tương thích của Langchain.
+
+```python
+import os
+import sys
+import json
+from dotenv import load_dotenv
+
+# Setup path và load config
+BASE_DIR = os.path.abspath('')
+PROJECT_ROOT = os.path.join(BASE_DIR, '..')
+sys.path.append(PROJECT_ROOT)
+load_dotenv(dotenv_path=os.path.join(PROJECT_ROOT, ".env"))
+
+from source.core.config import Settings
+from source.retrieval.hybrid_retriever import HybridRetriever
+
+# Khởi tạo Settings và Retriever như cũ
+settings = Settings()
+retriever = HybridRetriever(settings=settings, collection_name="Traffic_Law_Hybrid")
+
+# Load mảng BM25 (copy lại từ hàm _load_bm25_data của bạn)
+chunk_path = os.path.join(PROJECT_ROOT, "Data/chunks/traffic_chunks.json")
+with open(chunk_path, 'r', encoding='utf-8') as f:
+    retriever.corpus_chunks = json.load(f)
+    tokenized_corpus = [retriever._tokenize(c['content']) for c in retriever.corpus_chunks]
+    from rank_bm25 import BM25Okapi
+    retriever.bm25 = BM25Okapi(tokenized_corpus)
+
+print("✅ Đã khởi tạo Retriever và BM25!")
+```
+
+---
+
+### [Cell 2] Chuyển hóa Retriever thành Công cụ (Tools)
+
+Thay vì viết hàm if/else chia loại câu hỏi, ở thế giới Agentic, chúng ta đóng gói kĩ năng lại thành các công cụ (`@tool`).
+
+```python
+from langchain_core.tools import tool
+
+# Biến kĩ năng search của bạn thành một Hàm có mô tả chi tiết để LLM có thể đọc hiểu!
+@tool
+def search_traffic_law_tool(query: str) -> str:
+    """
+    Tìm kiếm thông tin Luật Giao Thông, văn bản pháp luật, 
+    biển báo, mức phạt, hoặc các tình huống giao thông.
+    """
+    print(f"\n[🛠️ Tool Gọi] Tìm kiếm: '{query}'...")
+    results = retriever.search(query, top_k=4, alpha=0.6)
+    
+    if not results:
+        return "Không có thông tin nội bộ."
+    
+    context_str = ""
+    for i, res in enumerate(results):
+        chunk = res['chunk']
+        m = chunk['metadata']
+        context_str += f"[{i+1}] {m.get('ten_van_ban', 'Luật')}\nNội dung: {chunk['content']}\n\n"
+        
+    return context_str
+
+# Gói tool vào một mảng
+tools = [search_traffic_law_tool]
+
+print("✅ Đã biến Retriever thành Tool Calling!")
+```
+
+---
+
+### [Cell 3] Kiểm tra độ thông minh của LLM (Bind tools)
+
+Ta dùng `ChatGoogleGenerativeAI` vì nó có khả năng "đọc" danh sách tools bằng hàm `bind_tools()`.
+
+```python
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+
+# Sử dụng model hỗ trợ Tool Calling
+gemini_key = settings.api_key or os.getenv("API_KEY")
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", api_key=gemini_key, temperature=0)
+
+# Khóa LLM với công cụ
+llm_with_tools = llm.bind_tools(tools)
+
+# THỬ NGHIỆM: Hỏi câu giao tiếp
+print("--- Test Giao tiếp ---")
+res1 = llm_with_tools.invoke("Chào buổi sáng, bạn khỏe không?")
+print(f"Tool calls: {getattr(res1, 'tool_calls', [])}")
+print(f"Trả lời: {res1.content}")
+
+# THỬ NGHIỆM: Hỏi câu Luật
+print("\n--- Test Hỏi Luật ---")
+res2 = llm_with_tools.invoke("Vượt đèn đỏ bị phạt bao nhiêu?")
+print(f"Tool calls: {getattr(res2, 'tool_calls', [])}") 
+# Lẽ ra ở res2 này, content sẽ rỗng, nhưng mảng tool_calls sẽ có giá trị chứa hàm `search_traffic_law_tool`!
+```
+*Bài học rút ra:* LLM tự biết phân loại thông minh, bạn không cần dùng code tĩnh chia if/else để Categorize nữa.
+
+---
+
+### [Cell 4] Xây dựng LangGraph: Ráp các mảnh lại với nhau
+
+Thay vì RAG trơn, ta tạo luồng `Agent RAG` để điều khiển chu trình tự động nhận yêu cầu -> gọi Tool nếu cần -> Trả kết quả bằng `StateGraph`.
+
+```python
+import operator
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import SystemMessage
+
+# 1. State: Đại diện cho lịch sử hội thoại mang vòng quanh đồ thị
+class MessagesState(TypedDict):
+    messages: Annotated[list, operator.add]
+
+# 2. Node Model Tâm thức
+# Hướng dẫn AI cách trả lời
+SYS_PROMPT = "Bạn là chuyên gia Luật GT. Luôn dùng 'search_traffic_law_tool' khi tra cập luật."
+def model_node(state: MessagesState):
+    messages = [SystemMessage(content=SYS_PROMPT)] + state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
+
+# 3. Node Tool
+# Tự động thực thi hàm khi Model yêu cầu
+tool_node = ToolNode(tools=tools)
+
+# 4. Điều hướng: Nếu cần gọi Tool thì đi tới Tool, không thì End
+def route_logic(state: MessagesState) -> Literal["tools", "__end__"]:
+    last_message = state["messages"][-1]
+    # Lấy thông tin tool từ tin nhắn cuối để rẽ nhánh
+    if getattr(last_message, "tool_calls", []):
+        return "tools"
+    return END
+
+# Biên dịch Graph
+builder = StateGraph(MessagesState)
+builder.add_node("model", model_node)
+builder.add_node("tools", tool_node)
+
+builder.add_edge(START, "model")
+builder.add_conditional_edges("model", route_logic)
+builder.add_edge("tools", "model") # Trả kết quả tool về lại Model
+
+# Thay vì quản lý list self.history thủ công, LangGraph làm thay bằng MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
+memory = MemorySaver()
+
+# Biên dịch ra Graph Cuối cùng
+traffic_agent = builder.compile(checkpointer=memory)
+
+# Hiển thị biểu đồ đồ thị (Nếu cần)
+from IPython.display import Image, display
+try:
+    display(Image(traffic_agent.get_graph().draw_mermaid_png()))
+except Exception:
+    print("Vẽ graph thất bại do thiếu thư viện, đồ thị cài đặt bình thường.")
+```
+
+---
+
+### [Cell 5] Chạy thử và Tận hưởng tác quả Streaming
+
+Bạn đã có một Graph thay cho Class Pipeline dài dòng cũ. Nó hỗ trợ Chat History tự động qua `thread_id`, Tools tự động phân loại và có Streaming chuẩn mực.
+
+```python
+import uuid
+# ID phiên làm việc (Mô phỏng 1 user)
+thread_id = str(uuid.uuid4())
+config = {"configurable": {"thread_id": thread_id}}
+
+def ask_agent(question: str):
+    print(f"\nUser: {question}")
+    
+    # Ở đây chúng ta Streaming ra "messages" và "updates"
+    stream_generator = traffic_agent.stream(
+        {"messages": [HumanMessage(content=question)]},
+        config=config,
+        stream_mode=["messages", "updates"],
+        version="v2"
+    )
+    
+    print("Bot: ", end="")
+    for chunk in stream_generator:
+        if chunk["type"] == "messages":
+            msg_chunk, metadata = chunk["data"]
+            # Chỉ in luồng văn bản của tư duy cuối (model), bỏ qua các log của tools
+            if metadata.get("langgraph_node") == "model" and msg_chunk.content:
+                print(msg_chunk.content, end="", flush=True)
+    print()
+
+# 1. Test tính hội thoại bình thường
+ask_agent("Hello! Buổi sáng tốt lành")
+
+# 2. Test khả năng tự kích hoạt Tool Tra cứu RAG
+ask_agent("Tôi lỡ đậu xe ô tô trên vỉa hè thì bị phạt bao nhiêu tiền?")
+
+# 3. Test Trí nhớ (Memory) tích hợp sẵn:
+# Ở truy vấn này, nó sẽ tự lôi hệ cảnh cũ (ô tô trên vỉa hè) thay vì xe máy ngoài đường
+ask_agent("Vậy nếu là xe máy đậu thì sao?") 
+```
+
+### Thành tựu đạt được qua bài Lab này:
+1. **Chia tay các hàm Lệnh Routing If/Else rườm rà**: (Intent/Category `if "0" in category`).
+2. **Không còn phải cắt nối History thủ công**: Không còn các lệnh `self.history.append` dễ gây nhầm lẫn. `MemorySaver` đã lo toàn bộ.
+3. **Biến HybridRetriever thành Tool**: Truy cập Database Luật giờ đây là một kỹ năng (Agentic Tool) linh động mà mô hình có thể bật tắt tuỳ khả năng nhận thức ngữ cảnh.
+4. **Streaming xịn xò**: Đánh chữ đến đâu in ra đến đó (Real-time).

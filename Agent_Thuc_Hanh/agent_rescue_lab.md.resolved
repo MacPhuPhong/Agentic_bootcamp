@@ -1,0 +1,170 @@
+# Lab: Xây dựng Agent Cứu Hộ Xe (Vehicle Support Agent)
+
+Chào mừng bạn đến với bài Lab thực hành xây dựng một Agent đích thực. Thay vì sử dụng dự án cũ, chúng ta sẽ tạo một hệ thống mới: **Trợ lý Cứu hộ Giao thông**.
+
+Agent này có nhiệm vụ:
+1. Chào hỏi và hỗ trợ khách hàng.
+2. Tra cứu danh sách trạm cứu hộ gần nhất (Tool tra cứu DB).
+3. Ghi nhớ thông tin xe của khách (Memory).
+4. Phản hồi thời gian thực (Streaming).
+
+---
+
+### [Cell 1] Khai báo thư viện & Tạo Database Giả Lập
+
+Chúng ta sẽ dùng một Dictionary đơn giản để đại diện cho Database các trạm cứu hộ.
+
+```python
+import os
+import uuid
+import operator
+from typing import Annotated, Literal, TypedDict
+from dotenv import load_dotenv
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+
+# Load API Key
+load_dotenv()
+
+# GIẢ LẬP DATABASE TRẠM CỨU HỘ
+RESCUE_DB = {
+    "hà nội": [
+        {"name": "Cứu hộ 24/7 Hà Nội", "phone": "0912-xxx-xxx", "services": ["Kích bình", "Cẩu xe"]},
+        {"name": "Gara Thành Công", "phone": "0988-xxx-xxx", "services": ["Vá lốp", "Sửa máy"]}
+    ],
+    "hồ chí minh": [
+        {"name": "Sài Gòn Rescue", "phone": "0903-xxx-xxx", "services": ["Cẩu xe", "Thay lốp"]},
+        {"name": "Đội cứu hộ Quận 1", "phone": "0944-xxx-xxx", "services": ["Hết xăng", "Kích điện"]}
+    ]
+}
+
+print("✅ Đã khởi tạo thư viện và Database giả lập!")
+```
+
+---
+
+### [Cell 2] Định nghĩa Tool tra cứu (Search Tool)
+
+Đây là "vũ khí" để Agent có thể tìm kiếm thông tin bên ngoài.
+
+```python
+@tool
+def search_rescue_stations(city: str) -> str:
+    """Tra cứu danh sách các trạm cứu hộ giao thông tại một thành phố cụ thể."""
+    city_lower = city.lower().strip()
+    print(f"\n[🛠️ Node Tool] Đang lục tìm trạm cứu hộ tại: {city}...")
+    
+    if city_lower in RESCUE_DB:
+        stations = RESCUE_DB[city_lower]
+        res = f"Tìm thấy {len(stations)} trạm tại {city}:\n"
+        for s in stations:
+            res += f"- {s['name']} (SĐT: {s['phone']}): Hỗ trợ {', '.join(s['services'])}\n"
+        return res
+    else:
+        return f"Rất tiếc, hiện tại chúng tôi chưa có dữ liệu cứu hộ tại thành phố '{city}'."
+
+tools = [search_rescue_stations]
+print("✅ Tool 'search_rescue_stations' đã sẵn sàng!")
+```
+
+---
+
+### [Cell 3] Cấu hình Não bộ (LLM) và Logic Đồ thị (LangGraph)
+
+Chúng ta sẽ thiết lập cách Agent suy nghĩ và rẽ nhánh.
+
+```python
+# Khởi tạo Model
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+llm_with_tools = llm.bind_tools(tools)
+
+# 1. Khai báo State (Trạng thái hội thoại)
+class MessagesState(TypedDict):
+    messages: Annotated[list, operator.add]
+
+# 2. Định nghĩa Node suy nghĩ (Model Node)
+def agent_node(state: MessagesState):
+    system_prompt = SystemMessage(content=(
+        "Bạn là chuyên gia điều phối cứu hộ giao thông chuyên nghiệp. "
+        "Hãy hỏi tên xe và vị trí của khách hàng. "
+        "Hãy dùng tool 'search_rescue_stations' khi biết khách đang ở thành phố nào để tìm trạm gần đó. "
+        "Luôn lịch sự và trấn an khách hàng."
+    ))
+    messages = [system_prompt] + state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
+
+# 3. Định nghĩa Edge rẽ nhánh (Router)
+def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return END
+
+# 4. Xây dựng Đồ thị
+builder = StateGraph(MessagesState)
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(tools))
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", should_continue)
+builder.add_edge("tools", "agent")
+
+# Tích hợp bộ nhớ (Memory)
+memory = MemorySaver()
+app = builder.compile(checkpointer=memory)
+
+print("✅ Agent Graph đã được biên dịch thành công!")
+```
+
+---
+
+### [Cell 4] Chạy Agent với Trí nhớ và Streaming
+
+Chúng ta sẽ viết một hàm chạy Agent hỗ trợ Thread ID để nhớ khách hàng là ai.
+
+```python
+def chat_with_rescue_agent(user_input: str, thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # Sử dụng stream_mode="messages" để lấy token thời gian thực (Streaming)
+    stream = app.stream(
+        {"messages": [HumanMessage(content=user_input)]},
+        config=config,
+        stream_mode="messages",
+        version="v2"
+    )
+    
+    print(f"\nUser: {user_input}")
+    print("Agent: ", end="")
+    
+    for chunk, metadata in stream:
+        if metadata["langgraph_node"] == "agent" and chunk.content:
+            print(chunk.content, end="", flush=True)
+    print("\n" + "-"*30)
+
+# TẠO MỘT PHIÊN CHAT MỚI
+my_session = str(uuid.uuid4())
+
+# Lần 1: Chào hỏi
+chat_with_rescue_agent("Chào bạn, tôi đang gặp sự cố xe hỏng!", my_session)
+
+# Lần 2: Cung cấp vị trí (Agent sẽ tự gọi Tool)
+chat_with_rescue_agent("Tôi đang ở TP Hồ Chí Minh, xe tôi bị nổ lốp.", my_session)
+
+# Lần 3: Kiểm tra trí nhớ (Không nhắc lại địa điểm)
+chat_with_rescue_agent("À, vậy nếu tôi muốn thay lốp thì gọi trạm nào?", my_session)
+```
+
+---
+
+### Bài học rút ra từ Lab này:
+1. **Tool Calling:** Agent không cần Code `if/else`, nó tự biết khi nào cần gọi `search_rescue_stations`.
+2. **Memory:** Nhờ `thread_id` và `MemorySaver`, Agent nhớ bạn đang ở HCM dù bạn không nhắc lại ở câu thứ 3.
+3. **Graph Logic:** Đồ thị giúp luồng đi linh hoạt (Agent -> Tool -> Agent -> End).
+4. **Streaming:** Tăng trải nghiệm người dùng bằng cách phản hồi ngay lập tức.
